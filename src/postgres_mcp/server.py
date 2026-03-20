@@ -13,6 +13,7 @@ from typing import Union
 
 import mcp.types as types
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from pydantic import Field
 from pydantic import validate_call
@@ -45,6 +46,18 @@ ResponseType = List[types.TextContent | types.ImageContent | types.EmbeddedResou
 
 logger = logging.getLogger(__name__)
 
+LOCAL_BIND_HOSTS = {"127.0.0.1", "localhost", "::1"}
+WILDCARD_BIND_HOSTS = {"0.0.0.0", "::"}
+LOCAL_ALLOWED_HOSTS = ["127.0.0.1", "127.0.0.1:*", "localhost", "localhost:*", "[::1]", "[::1]:*"]
+LOCAL_ALLOWED_ORIGINS = [
+    "http://127.0.0.1",
+    "http://127.0.0.1:*",
+    "http://localhost",
+    "http://localhost:*",
+    "http://[::1]",
+    "http://[::1]:*",
+]
+
 
 class AccessMode(str, Enum):
     """SQL access modes for the server."""
@@ -57,6 +70,80 @@ class AccessMode(str, Enum):
 db_connection = DbConnPool()
 current_access_mode = AccessMode.UNRESTRICTED
 shutdown_in_progress = False
+
+
+def _dedupe(values: list[str]) -> list[str]:
+    """Preserve order while removing duplicates."""
+    return list(dict.fromkeys(values))
+
+
+def _parse_header_patterns(values: list[str] | None) -> list[str]:
+    """Parse repeated and comma-delimited header allowlist arguments."""
+    parsed_values: list[str] = []
+    for value in values or []:
+        for item in value.split(","):
+            cleaned = item.strip()
+            if cleaned:
+                parsed_values.append(cleaned)
+    return _dedupe(parsed_values)
+
+
+def _default_allowed_hosts(bind_host: str) -> list[str]:
+    """Build safe default Host header patterns for the selected bind host."""
+    if bind_host in LOCAL_BIND_HOSTS:
+        return LOCAL_ALLOWED_HOSTS.copy()
+    if bind_host in WILDCARD_BIND_HOSTS:
+        return []
+    return [bind_host, f"{bind_host}:*"]
+
+
+def _default_allowed_origins(bind_host: str) -> list[str]:
+    """Build safe default Origin header patterns for the selected bind host."""
+    if bind_host in LOCAL_BIND_HOSTS:
+        return LOCAL_ALLOWED_ORIGINS.copy()
+    if bind_host in WILDCARD_BIND_HOSTS:
+        return []
+    return [
+        f"http://{bind_host}",
+        f"http://{bind_host}:*",
+        f"https://{bind_host}",
+        f"https://{bind_host}:*",
+    ]
+
+
+def build_transport_security_settings(
+    transport: str,
+    bind_host: str,
+    allowed_hosts: list[str] | None = None,
+    allowed_origins: list[str] | None = None,
+    disable_dns_rebinding_protection: bool = False,
+) -> TransportSecuritySettings | None:
+    """Configure HTTP transport validation for local and remote deployments."""
+    if transport == "stdio":
+        return None
+
+    parsed_allowed_hosts = _parse_header_patterns(allowed_hosts)
+    parsed_allowed_origins = _parse_header_patterns(allowed_origins)
+
+    if disable_dns_rebinding_protection:
+        return TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+    default_allowed_hosts = _default_allowed_hosts(bind_host)
+    default_allowed_origins = _default_allowed_origins(bind_host)
+
+    if bind_host in WILDCARD_BIND_HOSTS and not parsed_allowed_hosts and not parsed_allowed_origins:
+        logger.warning(
+            "DNS rebinding protection is disabled for %s because wildcard bind hosts require an explicit allowlist. "
+            "Set --allowed-host and optionally --allowed-origin to enable strict validation for remote deployments.",
+            bind_host,
+        )
+        return TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=_dedupe(default_allowed_hosts + parsed_allowed_hosts),
+        allowed_origins=_dedupe(default_allowed_origins + parsed_allowed_origins),
+    )
 
 
 async def get_sql_driver() -> Union[SqlDriver, SafeSqlDriver]:
@@ -596,6 +683,23 @@ async def main():
         default=8000,
         help="Port for streamable HTTP server (default: 8000)",
     )
+    parser.add_argument(
+        "--allowed-host",
+        action="append",
+        default=[],
+        help="Allowed Host header value for HTTP transports. Can be repeated or comma-separated.",
+    )
+    parser.add_argument(
+        "--allowed-origin",
+        action="append",
+        default=[],
+        help="Allowed Origin header value for HTTP transports. Can be repeated or comma-separated.",
+    )
+    parser.add_argument(
+        "--disable-dns-rebinding-protection",
+        action="store_true",
+        help="Disable HTTP Host/Origin validation. Recommended only behind a trusted gateway.",
+    )
 
     args = parser.parse_args()
 
@@ -658,14 +762,35 @@ async def main():
 
     # Run the server with the selected transport (always async)
     if args.transport == "stdio":
+        mcp.settings.transport_security = build_transport_security_settings(
+            transport=args.transport,
+            bind_host="localhost",
+            allowed_hosts=args.allowed_host,
+            allowed_origins=args.allowed_origin,
+            disable_dns_rebinding_protection=args.disable_dns_rebinding_protection,
+        )
         await mcp.run_stdio_async()
     elif args.transport == "sse":
         mcp.settings.host = args.sse_host
         mcp.settings.port = args.sse_port
+        mcp.settings.transport_security = build_transport_security_settings(
+            transport=args.transport,
+            bind_host=args.sse_host,
+            allowed_hosts=args.allowed_host,
+            allowed_origins=args.allowed_origin,
+            disable_dns_rebinding_protection=args.disable_dns_rebinding_protection,
+        )
         await mcp.run_sse_async()
     elif args.transport == "streamable-http":
         mcp.settings.host = args.streamable_http_host
         mcp.settings.port = args.streamable_http_port
+        mcp.settings.transport_security = build_transport_security_settings(
+            transport=args.transport,
+            bind_host=args.streamable_http_host,
+            allowed_hosts=args.allowed_host,
+            allowed_origins=args.allowed_origin,
+            disable_dns_rebinding_protection=args.disable_dns_rebinding_protection,
+        )
         await mcp.run_streamable_http_async()
 
 
